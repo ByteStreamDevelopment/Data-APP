@@ -1,0 +1,13 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+# Signatur-Schlüssel niemals einchecken
+keystore.properties
+*.jks
+*.keystore
