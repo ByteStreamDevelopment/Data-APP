@@ -11,6 +11,7 @@ import com.bytestreamdevelopment.dataapp.transfer.Bluetooth
 import com.bytestreamdevelopment.dataapp.transfer.FoundReceiver
 import com.bytestreamdevelopment.dataapp.transfer.OutgoingItem
 import com.bytestreamdevelopment.dataapp.transfer.ProximityTracker
+import com.bytestreamdevelopment.dataapp.transfer.ReceiverState
 import com.bytestreamdevelopment.dataapp.transfer.Sender
 import com.bytestreamdevelopment.dataapp.transfer.ShareParser
 import kotlinx.coroutines.CancellationException
@@ -151,11 +152,13 @@ class SendViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     }
                 }
+                ReceiverState.lastTransferAt = SystemClock.elapsedRealtime()
                 _phase.value = SendPhase.Done(target.name, items.size)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.w(TAG, "Senden fehlgeschlagen", e)
+                ReceiverState.lastTransferAt = SystemClock.elapsedRealtime()
                 _phase.value = SendPhase.Failed(
                     "Senden an ${target.name} fehlgeschlagen: ${e.message ?: "Verbindung unterbrochen"}", canRetry = true,
                 )

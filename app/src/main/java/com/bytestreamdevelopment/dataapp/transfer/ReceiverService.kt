@@ -19,6 +19,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.ParcelUuid
 import android.os.SystemClock
 import android.util.Log
@@ -29,6 +30,7 @@ import com.bytestreamdevelopment.dataapp.MainActivity
 import com.bytestreamdevelopment.dataapp.R
 import com.bytestreamdevelopment.dataapp.storage.AppPrefs
 import com.bytestreamdevelopment.dataapp.storage.FileSaver
+import com.bytestreamdevelopment.dataapp.storage.ReceivedContact
 import com.bytestreamdevelopment.dataapp.storage.ReceivedFile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -36,6 +38,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlin.random.Random
 import java.io.BufferedInputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -52,7 +55,21 @@ class ReceiverService : Service() {
     private var server: BluetoothServerSocket? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private var running = false
+    private var advertising = false
+    private var psm = 0
     private lateinit var prefs: AppPrefs
+
+    /** Zufällige ID je Dienststart; das Gerät mit der kleineren ID startet den Kontaktaustausch. */
+    private val instanceId = Random.nextInt(1, Int.MAX_VALUE)
+    private val trigger = ContactTrigger()
+    private lateinit var exchanger: ContactExchanger
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            // Hintergrundsuche nur bei eingeschaltetem Display – spart Akku.
+            if (intent.action == Intent.ACTION_SCREEN_ON) updateExchanger() else exchanger.stop()
+        }
+    }
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartFailure(errorCode: Int) {
@@ -77,11 +94,25 @@ class ReceiverService : Service() {
         prefs = AppPrefs(this)
         ensureHistory(this)
         createChannels(this)
+        exchanger = ContactExchanger(this, scope, prefs, instanceId, trigger) { card, from ->
+            saveContact(card, from)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopEverything()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_REFRESH) {
+            // Einstellungen/Visitenkarte geändert → Werbung (Kontakt-Flag) und Hintergrundsuche neu aufsetzen.
+            if (running) {
+                stopAdvertising()
+                if (!ReceiverState.shareActive.value) startAdvertising()
+                updateExchanger()
+            } else {
+                stopSelf()
+            }
             return START_NOT_STICKY
         }
         // startForeground bei jedem startForegroundService-Aufruf, auch wenn der Dienst schon läuft.
@@ -104,34 +135,38 @@ class ReceiverService : Service() {
         val adapter = Bluetooth.adapter(this)
         if (!Bluetooth.hasPermissions(this)) return fail("Bluetooth-Berechtigung fehlt")
         if (adapter == null || !adapter.isEnabled) return fail("Bluetooth ist ausgeschaltet")
-        val leAdvertiser = adapter.bluetoothLeAdvertiser ?: return fail("Dieses Handy kann nicht per Bluetooth LE werben")
+        advertiser = adapter.bluetoothLeAdvertiser ?: return fail("Dieses Handy kann nicht per Bluetooth LE werben")
 
         try {
             val socket = adapter.listenUsingInsecureL2capChannel()
             server = socket
-            val settings = AdvertiseSettings.Builder()
-                .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-                .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
-                .setConnectable(true)
-                .build()
-            val data = AdvertiseData.Builder()
-                .addServiceUuid(ParcelUuid(Proto.SERVICE_UUID))
-                .setIncludeDeviceName(false)
-                .setIncludeTxPowerLevel(false)
-                .build()
-            val scanResponse = AdvertiseData.Builder()
-                .addServiceData(ParcelUuid(Proto.SERVICE_UUID), Proto.encodeAdvert(socket.psm, Bluetooth.deviceName(this)))
-                .setIncludeDeviceName(false)
-                .build()
-            leAdvertiser.startAdvertising(settings, data, scanResponse, advertiseCallback)
-            advertiser = leAdvertiser
+            psm = socket.psm
             running = true
             ContextCompat.registerReceiver(
                 this, btStateReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
                 ContextCompat.RECEIVER_NOT_EXPORTED,
             )
+            ContextCompat.registerReceiver(
+                this, screenReceiver,
+                IntentFilter().apply { addAction(Intent.ACTION_SCREEN_ON); addAction(Intent.ACTION_SCREEN_OFF) },
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
             ReceiverState.set(ReceiverStatus.Waiting)
             scope.launch { acceptLoop(socket) }
+            // Solange auf diesem Handy der Teilen-Bildschirm offen ist, weder werben noch Kontakte tauschen.
+            // Der erste Wert (false) startet Werbung und Hintergrundsuche.
+            scope.launch(Dispatchers.Main) {
+                ReceiverState.shareActive.collect { active ->
+                    if (!running) return@collect
+                    if (active) {
+                        stopAdvertising()
+                        exchanger.stop()
+                    } else {
+                        startAdvertising()
+                        updateExchanger()
+                    }
+                }
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Start fehlgeschlagen", e)
             fail("Empfang konnte nicht gestartet werden: ${e.message}")
@@ -145,12 +180,14 @@ class ReceiverService : Service() {
             } catch (e: IOException) {
                 break // Server geschlossen
             }
+            exchanger.busy = true
             try {
                 handle(client)
             } catch (e: Exception) {
                 Log.w(TAG, "Übertragung fehlgeschlagen", e)
                 notifyResult("Übertragung abgebrochen", e.message ?: "Verbindung unterbrochen", null)
             } finally {
+                exchanger.busy = false
                 runCatching { client.close() }
                 if (running) {
                     ReceiverState.set(ReceiverStatus.Waiting)
@@ -163,7 +200,34 @@ class ReceiverService : Service() {
     private fun handle(client: BluetoothSocket) {
         val inp = DataInputStream(BufferedInputStream(client.inputStream, 64 * 1024))
         val out = DataOutputStream(client.outputStream)
-        val header = Proto.readHeader(inp)
+        when (val magic = inp.readInt()) {
+            Proto.CONTACT_MAGIC -> handleContact(inp, out)
+            else -> handleFiles(inp, out, magic)
+        }
+    }
+
+    /** Annehmende Seite des Kontaktaustauschs (Gegenstück zu [ContactExchanger]). */
+    private fun handleContact(inp: DataInputStream, out: DataOutputStream) {
+        val (peerId, card) = Proto.readContactRequest(inp)
+        val now = SystemClock.elapsedRealtime()
+        val allowed = prefs.contactExchangeActive && !ReceiverState.shareActive.value &&
+            synchronized(trigger) { trigger.mayExchange(peerId, now, ContactExchanger.lastTransferAt()) }
+        if (!allowed) {
+            out.writeByte(Proto.REJECT)
+            out.flush()
+            return
+        }
+        synchronized(trigger) { trigger.markExchanged(peerId, now) }
+        out.writeByte(Proto.ACCEPT)
+        Proto.writeCard(out, prefs.myCard)
+        out.flush()
+        saveContact(card, from = "")
+        runCatching { inp.readUnsignedByte() } // DONE des Initiators abwarten
+    }
+
+    private fun handleFiles(inp: DataInputStream, out: DataOutputStream, magic: Int) {
+        ReceiverState.lastTransferAt = SystemClock.elapsedRealtime()
+        val header = Proto.readHeader(inp, magic)
         out.writeByte(Proto.ACCEPT)
         out.flush()
 
@@ -199,6 +263,7 @@ class ReceiverService : Service() {
         out.flush()
         // Warten, bis der Sender die Verbindung schließt (liest -1), damit DONE sicher ankommt.
         runCatching { inp.read() }
+        ReceiverState.lastTransferAt = SystemClock.elapsedRealtime()
 
         val title = if (saved.size == 1) "Datei empfangen" else "${saved.size} Dateien empfangen"
         val text = if (saved.size == 1) {
@@ -215,6 +280,61 @@ class ReceiverService : Service() {
         prefs.saveHistory(list)
     }
 
+    private fun saveContact(card: ContactCard, from: String) {
+        if (card.isEmpty) return
+        val entry = ReceivedContact(card, from, System.currentTimeMillis())
+        val list = listOf(entry) + (ReceiverState.contacts.value ?: prefs.loadContacts())
+        ReceiverState.setContacts(list.take(AppPrefs.MAX_HISTORY))
+        prefs.saveContacts(list)
+        notifyContact(card)
+    }
+
+    private fun startAdvertising() {
+        val adv = advertiser ?: return
+        if (advertising || !running) return
+        try {
+            val settings = AdvertiseSettings.Builder()
+                .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+                .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
+                .setConnectable(true)
+                .build()
+            // Hauptpaket: Flags (3) + 128-Bit-UUID (18) + Herstellerdaten (4 + 5) = 30 von 31 Byte.
+            val data = AdvertiseData.Builder()
+                .addServiceUuid(ParcelUuid(Proto.SERVICE_UUID))
+                .addManufacturerData(
+                    Proto.MANUFACTURER_ID,
+                    Proto.encodeMeta(Proto.Meta(instanceId, prefs.contactExchangeActive)),
+                )
+                .setIncludeDeviceName(false)
+                .setIncludeTxPowerLevel(false)
+                .build()
+            val scanResponse = AdvertiseData.Builder()
+                .addServiceData(ParcelUuid(Proto.SERVICE_UUID), Proto.encodeAdvert(psm, Bluetooth.deviceName(this)))
+                .setIncludeDeviceName(false)
+                .build()
+            adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
+            advertising = true
+        } catch (e: Exception) {
+            Log.w(TAG, "Advertising-Start fehlgeschlagen", e)
+            fail("Bluetooth-Werbung konnte nicht gestartet werden: ${e.message}")
+        }
+    }
+
+    private fun stopAdvertising() {
+        if (!advertising) return
+        runCatching { advertiser?.stopAdvertising(advertiseCallback) }
+        advertising = false
+    }
+
+    private fun updateExchanger() {
+        val screenOn = getSystemService(PowerManager::class.java).isInteractive
+        if (running && screenOn && prefs.contactExchangeActive && !ReceiverState.shareActive.value) {
+            exchanger.start()
+        } else {
+            exchanger.stop()
+        }
+    }
+
     private fun fail(message: String) {
         ReceiverState.set(ReceiverStatus.Error(message))
         stopEverything(keepStatus = true)
@@ -223,9 +343,11 @@ class ReceiverService : Service() {
     private fun stopEverything(keepStatus: Boolean = false) {
         if (running) {
             runCatching { unregisterReceiver(btStateReceiver) }
+            runCatching { unregisterReceiver(screenReceiver) }
         }
         running = false
-        runCatching { advertiser?.stopAdvertising(advertiseCallback) }
+        if (::exchanger.isInitialized) exchanger.stop()
+        stopAdvertising()
         advertiser = null
         runCatching { server?.close() }
         server = null
@@ -290,9 +412,31 @@ class ReceiverService : Service() {
         }
     }
 
+    private fun notifyContact(card: ContactCard) {
+        val save = PendingIntent.getActivity(
+            this, card.hashCode(), ContactExchanger.insertIntent(card).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val text = listOf(card.title, card.details).filter { it.isNotBlank() }.joinToString(" – ")
+        val n = NotificationCompat.Builder(this, CHANNEL_RESULT)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("Kontakt empfangen")
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText("$text\nTippen, um ihn in deinen Kontakten zu speichern."))
+            .setAutoCancel(true)
+            .setContentIntent(save)
+            .addAction(0, "Speichern", save)
+            .build()
+        runCatching {
+            getSystemService(NotificationManager::class.java).notify(NOTIF_CONTACT_BASE + (card.hashCode() and 0xfff), n)
+        }
+    }
+
     companion object {
         private const val TAG = "ReceiverService"
         const val ACTION_STOP = "com.bytestreamdevelopment.dataapp.STOP_RECEIVER"
+        const val ACTION_REFRESH = "com.bytestreamdevelopment.dataapp.REFRESH_RECEIVER"
+        private const val NOTIF_CONTACT_BASE = 5000
         private const val CHANNEL_ONGOING = "receiver"
         private const val CHANNEL_RESULT = "results"
         private const val NOTIF_ONGOING = 1
@@ -307,8 +451,23 @@ class ReceiverService : Service() {
             context.startService(Intent(context, ReceiverService::class.java).setAction(ACTION_STOP))
         }
 
+        /** Nach Änderung von Visitenkarte/Einstellungen aufrufen (wirkt nur, wenn der Dienst läuft). */
+        fun refresh(context: Context) {
+            if (ReceiverState.status.value is ReceiverStatus.Waiting || ReceiverState.status.value is ReceiverStatus.Receiving) {
+                context.startService(Intent(context, ReceiverService::class.java).setAction(ACTION_REFRESH))
+            }
+        }
+
         fun ensureHistory(context: Context) {
-            if (ReceiverState.history.value == null) ReceiverState.setHistory(AppPrefs(context).loadHistory())
+            val prefs = AppPrefs(context)
+            if (ReceiverState.history.value == null) ReceiverState.setHistory(prefs.loadHistory())
+            if (ReceiverState.contacts.value == null) ReceiverState.setContacts(prefs.loadContacts())
+        }
+
+        fun removeContact(context: Context, entry: ReceivedContact) {
+            val list = (ReceiverState.contacts.value ?: emptyList()).filterNot { it == entry }
+            ReceiverState.setContacts(list)
+            AppPrefs(context).saveContacts(list)
         }
 
         fun removeFromHistory(context: Context, file: ReceivedFile) {

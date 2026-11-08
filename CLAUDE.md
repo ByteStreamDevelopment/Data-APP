@@ -21,6 +21,18 @@
   - Gespeichert wird über MediaStore: Bilder/Data-App, Filme/Data-App, Musik/Data-App, Download/Data-App.
     Verlauf (max. 100) als JSON in SharedPreferences `data_app`.
   - Geteilter Text (ohne Datei) wird als `Text_<Zeitstempel>.txt` gesendet.
+- **Kontaktaustausch (Issue #1)**: Halten zwei Handys mit laufendem Empfangsdienst *ohne* Datei aneinander,
+  tauschen sie ihre Visitenkarten („Meine Visitenkarte“: Name, Telefon, E-Mail, Firma, Website; `ContactCard`).
+  - Advertising-Hauptpaket enthält zusätzlich Herstellerdaten 0xFFFF = `Proto.Meta` (Flag Kontaktaustausch + zufällige
+    Instanz-ID; Paket 30/31 Byte). Das Gerät mit der **kleineren Instanz-ID** startet (`ContactTrigger`), die andere Seite
+    nimmt im `ReceiverService.handleContact` an (Unterscheidung über `CONTACT_MAGIC` vs. `MAGIC`).
+  - `ContactExchanger` scannt im Dienst (LOW_LATENCY, nur bei eingeschaltetem Display), Schwelle höchstens „Sehr nah“.
+  - Sperren: 2 min je Gegenstelle, 60 s nach jeder Dateiübertragung, und solange `ShareActivity` sichtbar ist
+    (`ReceiverState.shareActive` → Werbung + Kontaktsuche pausieren), damit Dateiversand keinen Kontakttausch auslöst.
+  - Empfangene Kontakte: Liste in der App + Benachrichtigung; Speichern über `ContactsContract.Intents.Insert`
+    (keine Kontakte-Berechtigung nötig). Gespeichert in SharedPreferences (`contacts`, `my_card`, `contact_exchange`).
+  - Einschränkung: Auf Android 10/11 liefert BLE-Scan im Hintergrund ohne ACCESS_BACKGROUND_LOCATION keine Ergebnisse →
+    dort klappt der Kontakttausch nur bei geöffneter App (bewusst keine Hintergrund-Standortberechtigung angefragt).
 - **Berechtigungen**: ab API 31 BLUETOOTH_SCAN (neverForLocation)/ADVERTISE/CONNECT; API 29/30 Standort (FINE+COARSE,
   Lint verlangt beide); POST_NOTIFICATIONS optional.
 - **Technik**: Kotlin 2.0.21, Jetpack Compose (Material 3, BOM 2024.12.01), AGP 8.7.3, Gradle 8.11.1, JDK 17,
@@ -31,4 +43,4 @@
   Kein KVM/Emulator, und BLE lässt sich ohnehin nur auf zwei echten Handys testen.
 - **Bekannte Grenzen / Ideen**: Durchsatz von BLE-L2CAP ca. 50–300 KB/s je nach Handy (große Videos dauern);
   RSSI-Werte schwanken je nach Modell → Einstellung „Sehr nah“ als Ausweichoption.
-  Mögliche Erweiterungen: Annahme-Dialog, 2M-PHY, Wi-Fi-Direct für große Dateien.
+  Mögliche Erweiterungen: Annahme-Dialog, Kontaktfoto, 2M-PHY, Wi-Fi-Direct für große Dateien.

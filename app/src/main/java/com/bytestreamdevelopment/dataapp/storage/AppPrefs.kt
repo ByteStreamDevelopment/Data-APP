@@ -2,6 +2,7 @@ package com.bytestreamdevelopment.dataapp.storage
 
 import android.content.Context
 import android.net.Uri
+import com.bytestreamdevelopment.dataapp.transfer.ContactCard
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -22,6 +23,8 @@ data class ReceivedFile(
     val time: Long,
 )
 
+data class ReceivedContact(val card: ContactCard, val from: String, val time: Long)
+
 class AppPrefs(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences("data_app", Context.MODE_PRIVATE)
 
@@ -33,6 +36,44 @@ class AppPrefs(context: Context) {
     var autoReceive: Boolean
         get() = prefs.getBoolean("auto_receive", true)
         set(v) = prefs.edit().putBoolean("auto_receive", v).apply()
+
+    /** Eigene Visitenkarte, die beim Aneinanderhalten ohne Datei ausgetauscht wird. */
+    var myCard: ContactCard
+        get() = cardFromJson(prefs.getString("my_card", null)) ?: ContactCard()
+        set(v) = prefs.edit().putString("my_card", cardToJson(v).toString()).apply()
+
+    var contactExchange: Boolean
+        get() = prefs.getBoolean("contact_exchange", true)
+        set(v) = prefs.edit().putBoolean("contact_exchange", v).apply()
+
+    /** Kontaktaustausch ist nur aktiv, wenn eingeschaltet und eine Karte ausgefüllt ist. */
+    val contactExchangeActive: Boolean get() = contactExchange && !myCard.isEmpty
+
+    fun loadContacts(): List<ReceivedContact> = runCatching {
+        val arr = JSONArray(prefs.getString("contacts", "[]"))
+        (0 until arr.length()).mapNotNull {
+            val o = arr.getJSONObject(it)
+            val card = cardFromJson(o.optJSONObject("card")?.toString()) ?: return@mapNotNull null
+            ReceivedContact(card, o.optString("from"), o.optLong("time"))
+        }
+    }.getOrDefault(emptyList())
+
+    fun saveContacts(list: List<ReceivedContact>) {
+        val arr = JSONArray()
+        list.take(MAX_HISTORY).forEach {
+            arr.put(JSONObject().put("card", cardToJson(it.card)).put("from", it.from).put("time", it.time))
+        }
+        prefs.edit().putString("contacts", arr.toString()).apply()
+    }
+
+    private fun cardToJson(c: ContactCard) = JSONObject().apply { c.toMap().forEach { (k, v) -> put(k, v) } }
+
+    private fun cardFromJson(json: String?): ContactCard? = json?.let {
+        runCatching {
+            val o = JSONObject(it)
+            ContactCard.fromMap(o.keys().asSequence().associateWith { k -> o.optString(k) })
+        }.getOrNull()
+    }
 
     fun loadHistory(): List<ReceivedFile> = runCatching {
         val arr = JSONArray(prefs.getString("history", "[]"))

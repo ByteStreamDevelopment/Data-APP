@@ -9,6 +9,10 @@ Dateien, Fotos und Texte zwischen zwei Android-Handys austauschen – einfach di
 2. Auf dem **sendenden** Handy ein Foto/eine Datei öffnen (Galerie, Dateien, …) → **Teilen** → **Data-App**.
 3. Handys aneinanderhalten – die Übertragung startet automatisch. Danach dürfen die Handys wieder auseinander.
 
+**Kontakte tauschen:** Unter „Meine Visitenkarte“ Name, Telefon, E-Mail usw. eintragen. Hält man dann zwei Handys
+mit Data-App *ohne* Datei aneinander (App läuft im Hintergrund, Display an), tauschen sie automatisch ihre Visitenkarten.
+Der empfangene Kontakt erscheint als Benachrichtigung und in der App und lässt sich mit einem Tipp in den Kontakten speichern.
+
 Empfangene Dateien landen in `Bilder/Data-App`, `Filme/Data-App`, `Musik/Data-App` bzw. `Download/Data-App`.
 
 ## Technik

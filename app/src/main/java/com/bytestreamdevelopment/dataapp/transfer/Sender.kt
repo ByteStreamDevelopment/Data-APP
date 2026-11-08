@@ -19,7 +19,13 @@ import java.io.DataOutputStream
 import java.io.IOException
 import java.io.InputStream
 
-data class FoundReceiver(val device: BluetoothDevice, val psm: Int, val name: String, val rssi: Int)
+data class FoundReceiver(
+    val device: BluetoothDevice,
+    val psm: Int,
+    val name: String,
+    val rssi: Int,
+    val meta: Proto.Meta?,
+)
 
 /** Eine zu sendende Datei; [open] liefert jedes Mal einen frischen Stream. */
 class OutgoingItem(val name: String, val mimeType: String, val size: Long, val open: () -> InputStream)
@@ -29,14 +35,17 @@ object Sender {
     private const val TAG = "Sender"
 
     /** Liefert laufend empfangsbereite Data-App-Geräte in der Nähe samt Signalstärke. */
-    fun scan(context: Context): Flow<FoundReceiver> = callbackFlow {
+    fun scan(context: Context, scanMode: Int = ScanSettings.SCAN_MODE_LOW_LATENCY): Flow<FoundReceiver> = callbackFlow {
         val scanner = Bluetooth.adapter(context)?.bluetoothLeScanner
             ?: throw IOException("Bluetooth ist ausgeschaltet")
         val uuid = ParcelUuid(Proto.SERVICE_UUID)
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val advert = Proto.decodeAdvert(result.scanRecord?.getServiceData(uuid)) ?: return
-                trySend(FoundReceiver(result.device, advert.psm, advert.name.ifBlank { "Unbekanntes Handy" }, result.rssi))
+                val meta = Proto.decodeMeta(result.scanRecord?.getManufacturerSpecificData(Proto.MANUFACTURER_ID))
+                trySend(
+                    FoundReceiver(result.device, advert.psm, advert.name.ifBlank { "Unbekanntes Handy" }, result.rssi, meta)
+                )
             }
 
             override fun onBatchScanResults(results: MutableList<ScanResult>) {
@@ -49,7 +58,7 @@ object Sender {
         }
         val filters = listOf(ScanFilter.Builder().setServiceUuid(uuid).build())
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(scanMode)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .setReportDelay(0)
             .build()
@@ -96,7 +105,7 @@ object Sender {
         }
     }
 
-    private suspend fun connectWithRetry(device: BluetoothDevice, psm: Int): android.bluetooth.BluetoothSocket {
+    suspend fun connectWithRetry(device: BluetoothDevice, psm: Int): android.bluetooth.BluetoothSocket {
         var last: IOException? = null
         repeat(3) { attempt ->
             val socket = device.createInsecureL2capChannel(psm)

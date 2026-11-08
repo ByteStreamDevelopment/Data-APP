@@ -69,6 +69,7 @@ fun MainScreen() {
     val prefs = remember { AppPrefs(ctx) }
     val status by ReceiverState.status.collectAsState()
     val history by ReceiverState.history.collectAsState()
+    val contacts by ReceiverState.contacts.collectAsState()
     var showSettings by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { ReceiverService.ensureHistory(ctx) }
@@ -103,6 +104,15 @@ fun MainScreen() {
                 }
             }
             item { HowToCard() }
+            item { MyCardCard(prefs) }
+            val contactList = contacts.orEmpty()
+            if (contactList.isNotEmpty()) {
+                item { SectionTitle("Empfangene Kontakte") }
+                items(contactList, key = { "c#${it.time}#${it.card.hashCode()}" }) { entry ->
+                    ReceivedContactRow(entry, onRemove = { ReceiverService.removeContact(ctx, entry) })
+                    HorizontalDivider()
+                }
+            }
             item { SectionTitle("Empfangen") }
             val list = history.orEmpty()
             if (list.isEmpty()) {
@@ -183,6 +193,7 @@ private fun HowToCard() {
             Text("1. Foto oder Datei öffnen (Galerie, Dateien …) und auf „Teilen“ tippen.")
             Text("2. „Data-App“ auswählen.")
             Text("3. Handys aneinanderhalten – die Übertragung startet automatisch.")
+            Text("Ohne Datei: Handys einfach aneinanderhalten, um eure Visitenkarten auszutauschen.")
             Text(
                 "Auf dem anderen Handy muss die Data-App installiert und empfangsbereit sein.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
