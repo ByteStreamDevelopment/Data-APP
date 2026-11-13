@@ -6,6 +6,8 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
@@ -18,7 +20,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.Uri
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.os.ParcelUuid
 import android.os.SystemClock
@@ -29,6 +34,7 @@ import androidx.core.content.ContextCompat
 import com.bytestreamdevelopment.dataapp.MainActivity
 import com.bytestreamdevelopment.dataapp.R
 import com.bytestreamdevelopment.dataapp.storage.AppPrefs
+import com.bytestreamdevelopment.dataapp.storage.CardPhotos
 import com.bytestreamdevelopment.dataapp.storage.FileSaver
 import com.bytestreamdevelopment.dataapp.storage.ReceivedContact
 import com.bytestreamdevelopment.dataapp.storage.ReceivedFile
@@ -40,9 +46,13 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.random.Random
 import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 
 /**
  * Vordergrunddienst „Empfangsbereit“: bewirbt sich per BLE mit [Proto.SERVICE_UUID] und nimmt über einen
@@ -63,6 +73,17 @@ class ReceiverService : Service() {
     private val instanceId = Random.nextInt(1, Int.MAX_VALUE)
     private val trigger = ContactTrigger()
     private lateinit var exchanger: ContactExchanger
+
+    /** Offene Verbindungen der laufenden Übertragung – Schließen bricht sie ab. */
+    private val active = CopyOnWriteArrayList<Closeable>()
+
+    @Volatile
+    private var cancelled = false
+
+    /** true ab der Annahme einer Dateiübertragung (für Fehlermeldungen und „Abbrechen“). */
+    @Volatile
+    private var transferring = false
+    private lateinit var wakeLock: PowerManager.WakeLock
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -94,14 +115,27 @@ class ReceiverService : Service() {
         prefs = AppPrefs(this)
         ensureHistory(this)
         createChannels(this)
-        exchanger = ContactExchanger(this, scope, prefs, instanceId, trigger) { card, from ->
-            saveContact(card, from)
+        wakeLock = getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DataApp:Empfang")
+            .apply { setReferenceCounted(false) }
+        exchanger = ContactExchanger(this, scope, prefs, instanceId, trigger) { card, photo, from ->
+            saveContact(card, photo, from)
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopEverything()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_CANCEL) {
+            if (running) cancelTransfer() else stopSelf()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_ANSWER) {
+            val decision = runCatching { Decision.valueOf(intent.getStringExtra(EXTRA_DECISION)!!) }.getOrDefault(Decision.REJECT)
+            ReceiverState.answer(intent.getLongExtra(EXTRA_REQUEST, 0), decision)
+            if (!running) stopSelf()
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_REFRESH) {
@@ -118,7 +152,7 @@ class ReceiverService : Service() {
         // startForeground bei jedem startForegroundService-Aufruf, auch wenn der Dienst schon läuft.
         try {
             ServiceCompat.startForeground(
-                this, NOTIF_ONGOING, ongoingNotification("Halte ein anderes Handy an dieses, um Dateien zu empfangen."),
+                this, NOTIF_ONGOING, ongoingNotification(IDLE_TEXT),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
             )
         } catch (e: Exception) {
@@ -181,34 +215,45 @@ class ReceiverService : Service() {
                 break // Server geschlossen
             }
             exchanger.busy = true
+            cancelled = false
+            active += client
             try {
                 handle(client)
             } catch (e: Exception) {
                 Log.w(TAG, "Übertragung fehlgeschlagen", e)
-                notifyResult("Übertragung abgebrochen", e.message ?: "Verbindung unterbrochen", null)
+                if (transferring) {
+                    Feedback.failure(this, prefs)
+                    notifyResult(
+                        "Übertragung abgebrochen",
+                        if (cancelled) "Du hast den Empfang abgebrochen." else e.message ?: "Verbindung unterbrochen",
+                        null,
+                    )
+                }
             } finally {
+                transferring = false
                 exchanger.busy = false
-                runCatching { client.close() }
+                active.forEach { runCatching { it.close() } }
+                active.clear()
+                if (wakeLock.isHeld) runCatching { wakeLock.release() }
                 if (running) {
                     ReceiverState.set(ReceiverStatus.Waiting)
-                    updateOngoing("Halte ein anderes Handy an dieses, um Dateien zu empfangen.")
+                    updateOngoing(IDLE_TEXT)
                 }
             }
         }
     }
 
     private fun handle(client: BluetoothSocket) {
-        val inp = DataInputStream(BufferedInputStream(client.inputStream, 64 * 1024))
-        val out = DataOutputStream(client.outputStream)
-        when (val magic = inp.readInt()) {
-            Proto.CONTACT_MAGIC -> handleContact(inp, out)
-            else -> handleFiles(inp, out, magic)
+        val channel = Handshake.respond(BufferedInputStream(client.inputStream, 64 * 1024), client.outputStream)
+        when (val magic = channel.input.readInt()) {
+            Proto.CONTACT_MAGIC -> handleContact(channel.input, channel.output)
+            else -> handleFiles(channel, magic)
         }
     }
 
     /** Annehmende Seite des Kontaktaustauschs (Gegenstück zu [ContactExchanger]). */
     private fun handleContact(inp: DataInputStream, out: DataOutputStream) {
-        val (peerId, card) = Proto.readContactRequest(inp)
+        val (peerId, payload) = Proto.readContactRequest(inp)
         val now = SystemClock.elapsedRealtime()
         val allowed = prefs.contactExchangeActive && !ReceiverState.shareActive.value &&
             synchronized(trigger) { trigger.mayExchange(peerId, now, ContactExchanger.lastTransferAt()) }
@@ -219,59 +264,166 @@ class ReceiverService : Service() {
         }
         synchronized(trigger) { trigger.markExchanged(peerId, now) }
         out.writeByte(Proto.ACCEPT)
-        Proto.writeCard(out, prefs.myCard)
+        Proto.writeCard(out, prefs.myCard, CardPhotos.loadMine(this))
         out.flush()
-        saveContact(card, from = "")
+        saveContact(payload.card, payload.photo, from = "")
         runCatching { inp.readUnsignedByte() } // DONE des Initiators abwarten
     }
 
-    private fun handleFiles(inp: DataInputStream, out: DataOutputStream, magic: Int) {
+    private fun handleFiles(channel: SecureChannel, magic: Int) {
+        val inp = channel.input
+        val out = channel.output
         ReceiverState.lastTransferAt = SystemClock.elapsedRealtime()
         val header = Proto.readHeader(inp, magic)
+        val deviceId = Proto.readAuth(inp, channel.keys.transcript)
+        Feedback.detected(this, prefs)
+
+        if (prefs.askBeforeReceive && !prefs.isTrusted(deviceId)) {
+            when (askUser(header, deviceId, channel.keys.code)) {
+                Decision.ACCEPT -> Unit
+                Decision.ACCEPT_AND_TRUST -> prefs.trust(deviceId, header.senderName)
+                else -> {
+                    out.writeByte(Proto.REJECT)
+                    out.flush()
+                    runCatching { inp.read() }
+                    return
+                }
+            }
+        }
+        transferring = true
+        runCatching { wakeLock.acquire(60 * 60 * 1000L) }
+
+        // Große Übertragung: WLAN-Direct-Gruppe eröffnen und dem Sender die Zugangsdaten schicken.
+        var host: WifiDirect.Host? = null
+        if (header.wifiOffered && WifiDirect.isAvailable(this, prefs)) {
+            ReceiverState.set(ReceiverStatus.Receiving(header.senderName, 0, header.fileCount, "WLAN-Verbindung wird aufgebaut …", 0, header.totalBytes))
+            host = WifiDirect.Host.open(this)?.also { active += it }
+        }
         out.writeByte(Proto.ACCEPT)
+        if (host != null) {
+            out.writeByte(Proto.TRANSPORT_WIFI)
+            Proto.writeWifiInfo(out, host.info)
+        } else {
+            out.writeByte(Proto.TRANSPORT_BLE)
+        }
         out.flush()
+
+        var data = channel
+        var viaWifi = false
+        if (host != null) {
+            if (inp.readUnsignedByte() == 1) {
+                val tcp = host.accept(15_000)
+                active += tcp
+                data = Handshake.wrap(
+                    tcp.getInputStream(), tcp.getOutputStream(), channel.keys, SessionKeys.WIFI_R2I, SessionKeys.WIFI_I2R,
+                )
+                viaWifi = true
+            } else {
+                host.close() // Sender kam nicht ins WLAN → weiter über Bluetooth
+            }
+        }
 
         val saved = mutableListOf<ReceivedFile>()
         var done = 0L
         var lastUi = 0L
         repeat(header.fileCount) { index ->
-            val fh = Proto.readFileHeader(inp)
+            val fh = Proto.readFileHeader(data.input)
+            val isText = fh.mimeType == Proto.MIME_TEXT
+            val label = if (isText) "Text" else fh.name
             fun publish(force: Boolean) {
                 val now = SystemClock.elapsedRealtime()
                 if (!force && now - lastUi < 250) return
                 lastUi = now
                 ReceiverState.set(
-                    ReceiverStatus.Receiving(header.senderName, index, header.fileCount, fh.name, done, header.totalBytes)
+                    ReceiverStatus.Receiving(header.senderName, index, header.fileCount, label, done, header.totalBytes, viaWifi)
                 )
                 updateOngoing(
-                    "Empfange ${fh.name} (${index + 1}/${header.fileCount}) von ${header.senderName}",
+                    "Empfange $label (${index + 1}/${header.fileCount}) von ${header.senderName}",
                     progress = if (header.totalBytes > 0) (done * 100 / header.totalBytes).toInt() else 0,
                 )
             }
             publish(force = true)
-            val uri = FileSaver.save(this, fh.name, fh.mimeType) { os ->
-                Proto.copyExactly(inp, os, fh.size) { n ->
-                    done += n
-                    publish(force = false)
+            val file = if (isText) {
+                if (fh.size > Proto.MAX_TEXT_BYTES) throw IOException("Text ist zu lang")
+                val bytes = ByteArrayOutputStream()
+                Proto.copyExactly(data.input, bytes, fh.size) { n -> done += n }
+                val text = bytes.toString("UTF-8")
+                copyToClipboard(text)
+                ReceivedFile(
+                    text.trim().take(80), fh.mimeType, fh.size, Uri.EMPTY, header.senderName, System.currentTimeMillis(), text,
+                )
+            } else {
+                val uri = FileSaver.save(this, fh.name, fh.mimeType) { os ->
+                    Proto.copyExactly(data.input, os, fh.size) { n ->
+                        done += n
+                        publish(force = false)
+                    }
                 }
+                ReceivedFile(fh.name, fh.mimeType, fh.size, uri, header.senderName, System.currentTimeMillis())
             }
-            val file = ReceivedFile(fh.name, fh.mimeType, fh.size, uri, header.senderName, System.currentTimeMillis())
             saved += file
             addToHistory(file)
         }
-        out.writeByte(Proto.DONE)
-        out.flush()
+        data.output.writeByte(Proto.DONE)
+        data.output.flush()
         // Warten, bis der Sender die Verbindung schließt (liest -1), damit DONE sicher ankommt.
-        runCatching { inp.read() }
+        runCatching { data.input.read() }
         ReceiverState.lastTransferAt = SystemClock.elapsedRealtime()
+        transferring = false
+        Feedback.success(this, prefs)
 
-        val title = if (saved.size == 1) "Datei empfangen" else "${saved.size} Dateien empfangen"
-        val text = if (saved.size == 1) {
-            "${saved[0].name} von ${header.senderName} – gespeichert in ${FileSaver.folderDescription(saved[0].mimeType)}"
-        } else {
-            "Von ${header.senderName} – gespeichert im Ordner „${FileSaver.FOLDER}“"
+        val single = saved.singleOrNull()
+        val via = if (viaWifi) " (per WLAN)" else ""
+        when {
+            single?.text != null -> {
+                val link = Proto.asLink(single.text)
+                notifyResult(
+                    if (link != null) "Link von ${header.senderName}" else "Text von ${header.senderName}",
+                    "${single.text.trim().take(300)}\nIn die Zwischenablage kopiert" + if (link != null) " – tippen zum Öffnen." else ".",
+                    single,
+                )
+            }
+            single != null -> notifyResult(
+                "Datei empfangen$via",
+                "${single.name} von ${header.senderName} – gespeichert in ${FileSaver.folderDescription(single.mimeType)}",
+                single,
+            )
+            else -> notifyResult(
+                "${saved.size} Dateien empfangen$via",
+                "Von ${header.senderName} – gespeichert im Ordner „${FileSaver.FOLDER}“",
+                null,
+            )
         }
-        notifyResult(title, text, saved.singleOrNull())
+    }
+
+    /** Fragt den Nutzer (Dialog in der App + Benachrichtigung), ob empfangen werden soll. null = keine Antwort. */
+    private fun askUser(header: Proto.Header, deviceId: String, code: String): Decision? {
+        val request = IncomingRequest(
+            SystemClock.elapsedRealtimeNanos(), header.senderName, deviceId, header.fileCount, header.totalBytes, code,
+        )
+        val answers = ReceiverState.ask(request)
+        notifyRequest(request)
+        return try {
+            answers.poll(ASK_TIMEOUT_S, TimeUnit.SECONDS)
+        } finally {
+            ReceiverState.clearPending()
+            getSystemService(NotificationManager::class.java).cancel(NOTIF_REQUEST)
+        }
+    }
+
+    private fun copyToClipboard(text: String) {
+        Handler(Looper.getMainLooper()).post {
+            runCatching {
+                getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Data-App", text))
+            }
+        }
+    }
+
+    /** Bricht die laufende Übertragung bzw. offene Anfrage ab. */
+    private fun cancelTransfer() {
+        cancelled = true
+        ReceiverState.rejectPending()
+        active.forEach { runCatching { it.close() } }
     }
 
     private fun addToHistory(file: ReceivedFile) {
@@ -280,13 +432,16 @@ class ReceiverService : Service() {
         prefs.saveHistory(list)
     }
 
-    private fun saveContact(card: ContactCard, from: String) {
+    private fun saveContact(card: ContactCard, photo: ByteArray?, from: String) {
         if (card.isEmpty) return
-        val entry = ReceivedContact(card, from, System.currentTimeMillis())
+        val time = System.currentTimeMillis()
+        val photoName = photo?.let { runCatching { CardPhotos.saveReceived(this, it, time) }.getOrNull() }
+        val entry = ReceivedContact(card, from, time, photoName)
         val list = listOf(entry) + (ReceiverState.contacts.value ?: prefs.loadContacts())
         ReceiverState.setContacts(list.take(AppPrefs.MAX_HISTORY))
         prefs.saveContacts(list)
-        notifyContact(card)
+        Feedback.success(this, prefs)
+        notifyContact(card, photo)
     }
 
     private fun startAdvertising() {
@@ -346,6 +501,7 @@ class ReceiverService : Service() {
             runCatching { unregisterReceiver(screenReceiver) }
         }
         running = false
+        cancelTransfer()
         if (::exchanger.isInitialized) exchanger.stop()
         stopAdvertising()
         advertiser = null
@@ -381,8 +537,14 @@ class ReceiverService : Service() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(openAppIntent())
-            .addAction(0, "Beenden", stop)
-            .apply { if (progress != null) setProgress(100, progress, false) }
+            .apply {
+                if (progress != null) {
+                    setProgress(100, progress, false)
+                    addAction(0, "Abbrechen", serviceIntent(3, Intent(this@ReceiverService, ReceiverService::class.java).setAction(ACTION_CANCEL)))
+                } else {
+                    addAction(0, "Beenden", stop)
+                }
+            }
             .build()
     }
 
@@ -390,8 +552,45 @@ class ReceiverService : Service() {
         getSystemService(NotificationManager::class.java).notify(NOTIF_ONGOING, ongoingNotification(text, progress))
     }
 
+    private fun serviceIntent(requestCode: Int, intent: Intent): PendingIntent =
+        PendingIntent.getService(this, requestCode, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
+    private fun notifyRequest(request: IncomingRequest) {
+        fun answer(code: Int, decision: Decision) = serviceIntent(
+            code,
+            Intent(this, ReceiverService::class.java).setAction(ACTION_ANSWER)
+                .putExtra(EXTRA_REQUEST, request.id).putExtra(EXTRA_DECISION, decision.name),
+        )
+        val what = if (request.fileCount == 1) "1 Element" else "${request.fileCount} Elemente"
+        val text = "${request.senderName} möchte $what senden (${formatBytes(request.totalBytes)}). Code: ${request.code}"
+        val n = NotificationCompat.Builder(this, CHANNEL_REQUEST)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("Empfang bestätigen")
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setTimeoutAfter(ASK_TIMEOUT_S * 1000)
+            .setContentIntent(openAppIntent())
+            .addAction(0, "Annehmen", answer(10, Decision.ACCEPT))
+            .addAction(0, "Ablehnen", answer(11, Decision.REJECT))
+            .build()
+        runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_REQUEST, n) }
+    }
+
+    private fun formatBytes(bytes: Long): String = when {
+        bytes < 1024 -> "$bytes B"
+        bytes < 1024 * 1024 -> "${bytes / 1024} KB"
+        else -> String.format(java.util.Locale.GERMANY, "%.1f MB", bytes / (1024.0 * 1024.0))
+    }
+
     private fun notifyResult(title: String, text: String, single: ReceivedFile?) {
-        val tap = if (single != null) {
+        val link = single?.text?.let(Proto::asLink)
+        val tap = if (link != null) {
+            PendingIntent.getActivity(
+                this, 4, Intent(Intent.ACTION_VIEW, Uri.parse(link)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+        } else if (single != null && single.text == null) {
             val view = Intent(Intent.ACTION_VIEW)
                 .setDataAndType(single.uri, single.mimeType)
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -412,9 +611,9 @@ class ReceiverService : Service() {
         }
     }
 
-    private fun notifyContact(card: ContactCard) {
+    private fun notifyContact(card: ContactCard, photo: ByteArray?) {
         val save = PendingIntent.getActivity(
-            this, card.hashCode(), ContactExchanger.insertIntent(card).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            this, card.hashCode(), ContactExchanger.insertIntent(card, photo).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val text = listOf(card.title, card.details).filter { it.isNotBlank() }.joinToString(" – ")
@@ -423,6 +622,7 @@ class ReceiverService : Service() {
             .setContentTitle("Kontakt empfangen")
             .setContentText(text)
             .setStyle(NotificationCompat.BigTextStyle().bigText("$text\nTippen, um ihn in deinen Kontakten zu speichern."))
+            .setLargeIcon(CardPhotos.decode(photo))
             .setAutoCancel(true)
             .setContentIntent(save)
             .addAction(0, "Speichern", save)
@@ -436,6 +636,19 @@ class ReceiverService : Service() {
         private const val TAG = "ReceiverService"
         const val ACTION_STOP = "com.bytestreamdevelopment.dataapp.STOP_RECEIVER"
         const val ACTION_REFRESH = "com.bytestreamdevelopment.dataapp.REFRESH_RECEIVER"
+        const val ACTION_CANCEL = "com.bytestreamdevelopment.dataapp.CANCEL_TRANSFER"
+        const val ACTION_ANSWER = "com.bytestreamdevelopment.dataapp.ANSWER_REQUEST"
+        private const val EXTRA_REQUEST = "request"
+        private const val EXTRA_DECISION = "decision"
+        private const val CHANNEL_REQUEST = "requests"
+        private const val NOTIF_REQUEST = 2
+        private const val ASK_TIMEOUT_S = 45L
+        private const val IDLE_TEXT = "Halte ein anderes Handy an dieses, um Dateien zu empfangen."
+
+        /** Laufenden Empfang abbrechen. */
+        fun cancelTransfer(context: Context) {
+            context.startService(Intent(context, ReceiverService::class.java).setAction(ACTION_CANCEL))
+        }
         private const val NOTIF_CONTACT_BASE = 5000
         private const val CHANNEL_ONGOING = "receiver"
         private const val CHANNEL_RESULT = "results"
@@ -465,6 +678,7 @@ class ReceiverService : Service() {
         }
 
         fun removeContact(context: Context, entry: ReceivedContact) {
+            CardPhotos.deleteReceived(context, entry.photo)
             val list = (ReceiverState.contacts.value ?: emptyList()).filterNot { it == entry }
             ReceiverState.setContacts(list)
             AppPrefs(context).saveContacts(list)
@@ -480,6 +694,9 @@ class ReceiverService : Service() {
             val nm = context.getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(
                 NotificationChannel(CHANNEL_ONGOING, "Empfangsbereitschaft", NotificationManager.IMPORTANCE_LOW)
+            )
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL_REQUEST, "Empfangsanfragen", NotificationManager.IMPORTANCE_HIGH)
             )
             nm.createNotificationChannel(
                 NotificationChannel(CHANNEL_RESULT, "Empfangene Dateien", NotificationManager.IMPORTANCE_DEFAULT)

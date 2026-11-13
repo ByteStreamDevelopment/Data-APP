@@ -8,6 +8,7 @@ import android.os.SystemClock
 import android.provider.ContactsContract
 import android.util.Log
 import com.bytestreamdevelopment.dataapp.storage.AppPrefs
+import com.bytestreamdevelopment.dataapp.storage.CardPhotos
 import com.bytestreamdevelopment.dataapp.storage.Proximity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -19,9 +20,6 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.BufferedOutputStream
-import java.io.DataInputStream
-import java.io.DataOutputStream
 
 /**
  * Initiator-Seite des Kontaktaustauschs: sucht im Hintergrund nach Data-App-Geräten und tauscht Visitenkarten,
@@ -35,7 +33,7 @@ class ContactExchanger(
     private val prefs: AppPrefs,
     private val instanceId: Int,
     private val trigger: ContactTrigger,
-    private val onReceived: (card: ContactCard, from: String) -> Unit,
+    private val onReceived: (card: ContactCard, photo: ByteArray?, from: String) -> Unit,
 ) {
     private var job: Job? = null
 
@@ -88,14 +86,15 @@ class ContactExchanger(
         try {
             withContext(Dispatchers.IO) {
                 Sender.connectWithRetry(target.device, target.psm).use { s ->
-                    val out = DataOutputStream(BufferedOutputStream(s.outputStream))
-                    val inp = DataInputStream(s.inputStream)
-                    Proto.writeContactRequest(out, instanceId, prefs.myCard)
+                    val channel = Handshake.initiate(s.inputStream, s.outputStream)
+                    val out = channel.output
+                    val inp = channel.input
+                    Proto.writeContactRequest(out, instanceId, prefs.myCard, CardPhotos.loadMine(context))
                     if (inp.readUnsignedByte() == Proto.ACCEPT) {
-                        val card = Proto.readCard(inp)
+                        val payload = Proto.readCard(inp)
                         out.writeByte(Proto.DONE)
                         out.flush()
-                        onReceived(card, target.name)
+                        onReceived(payload.card, payload.photo, target.name)
                         runCatching { inp.read() } // warten, bis die Gegenseite schließt
                     } else {
                         Log.i(TAG, "Kontaktaustausch von ${target.name} abgelehnt")
@@ -125,20 +124,27 @@ class ContactExchanger(
         fun lastTransferAt(): Long? = ReceiverState.lastTransferAt.takeIf { it > 0 }
 
         /** Öffnet die Kontakte-App mit vorausgefülltem Formular zum Speichern. */
-        fun insertIntent(card: ContactCard): Intent =
+        fun insertIntent(card: ContactCard, photo: ByteArray? = null): Intent =
             Intent(ContactsContract.Intents.Insert.ACTION).apply {
                 type = ContactsContract.RawContacts.CONTENT_TYPE
                 if (card.name.isNotBlank()) putExtra(ContactsContract.Intents.Insert.NAME, card.name)
                 if (card.phone.isNotBlank()) putExtra(ContactsContract.Intents.Insert.PHONE, card.phone)
                 if (card.email.isNotBlank()) putExtra(ContactsContract.Intents.Insert.EMAIL, card.email)
                 if (card.company.isNotBlank()) putExtra(ContactsContract.Intents.Insert.COMPANY, card.company)
+                val rows = ArrayList<ContentValues>()
                 if (card.website.isNotBlank()) {
-                    val web = ContentValues().apply {
+                    rows += ContentValues().apply {
                         put(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Website.CONTENT_ITEM_TYPE)
                         put(ContactsContract.CommonDataKinds.Website.URL, card.website)
                     }
-                    putParcelableArrayListExtra(ContactsContract.Intents.Insert.DATA, arrayListOf(web))
                 }
+                if (photo != null) {
+                    rows += ContentValues().apply {
+                        put(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+                        put(ContactsContract.CommonDataKinds.Photo.PHOTO, photo)
+                    }
+                }
+                if (rows.isNotEmpty()) putParcelableArrayListExtra(ContactsContract.Intents.Insert.DATA, rows)
             }
     }
 }

@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import com.bytestreamdevelopment.dataapp.storage.Proximity
+import com.bytestreamdevelopment.dataapp.transfer.Proto
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,24 +69,33 @@ fun SendScreen(vm: SendViewModel, onClose: () -> Unit) {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            if (items.isNotEmpty()) FilesCard(items.map { it.name }, items.sumOf { it.size })
+            if (items.isNotEmpty()) {
+                FilesCard(items.map { it.name }, items.sumOf { it.size }, isText = items.all { it.mimeType == Proto.MIME_TEXT })
+            }
 
             BluetoothGate {
                 LaunchedEffect(phase) { if (phase == SendPhase.Searching) vm.startScanning() }
                 LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.startScanning() }
                 LifecycleEventEffect(Lifecycle.Event.ON_PAUSE) { vm.pauseScanning() }
-                PhaseContent(phase, nearby, vm.proximity, onSend = vm::sendTo, onRetry = vm::retry, onClose = onClose)
+                PhaseContent(
+                    phase, nearby, vm.proximity,
+                    onSend = vm::sendTo, onRetry = vm::retry, onCancel = vm::cancel, onClose = onClose,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun FilesCard(names: List<String>, total: Long) {
+private fun FilesCard(names: List<String>, total: Long, isText: Boolean) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(
-                if (names.size == 1) "1 Datei · ${formatSize(total)}" else "${names.size} Dateien · ${formatSize(total)}",
+                when {
+                    isText -> "Wird in die Zwischenablage des anderen Handys gelegt"
+                    names.size == 1 -> "1 Datei · ${formatSize(total)}"
+                    else -> "${names.size} Dateien · ${formatSize(total)}"
+                },
                 style = MaterialTheme.typography.titleMedium,
             )
             names.take(4).forEach { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium) }
@@ -101,6 +111,7 @@ private fun PhaseContent(
     proximity: Proximity,
     onSend: (String) -> Unit,
     onRetry: () -> Unit,
+    onCancel: () -> Unit,
     onClose: () -> Unit,
 ) {
     Column(
@@ -137,11 +148,32 @@ private fun PhaseContent(
             }
             is SendPhase.Connecting -> {
                 CircularProgressIndicator(Modifier.size(64.dp))
-                Text("Verbinde mit ${phase.to} …", style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center)
+                Text(
+                    if (phase.wifi) "Baue schnelle WLAN-Verbindung zu ${phase.to} auf …" else "Verbinde mit ${phase.to} …",
+                    style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center,
+                )
+                OutlinedButton(onClick = onCancel) { Text("Abbrechen") }
+            }
+            is SendPhase.Waiting -> {
+                CircularProgressIndicator(Modifier.size(64.dp))
+                Text(
+                    "Warte auf Bestätigung von ${phase.to} …",
+                    style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center,
+                )
+                Text("Code: ${phase.code}", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                Text(
+                    "Auf dem anderen Handy muss derselbe Code stehen. Bei vertrauten Geräten geht es ohne Nachfrage weiter.",
+                    textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedButton(onClick = onCancel) { Text("Abbrechen") }
             }
             is SendPhase.Sending -> {
                 Pulse(Icons.Default.Share, active = false, size = 140.dp)
-                Text("Sende an ${phase.to}", style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center)
+                Text(
+                    if (phase.viaWifi) "Sende an ${phase.to} (per WLAN)" else "Sende an ${phase.to}",
+                    style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center,
+                )
                 Text(
                     "${phase.fileName} (${phase.index + 1}/${phase.count})",
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -159,6 +191,7 @@ private fun PhaseContent(
                     textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                OutlinedButton(onClick = onCancel) { Text("Abbrechen") }
             }
             is SendPhase.Done -> {
                 Icon(

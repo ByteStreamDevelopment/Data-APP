@@ -5,6 +5,7 @@ import com.bytestreamdevelopment.dataapp.storage.ReceivedFile
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.ArrayBlockingQueue
 
 sealed interface ReceiverStatus {
     data object Off : ReceiverStatus
@@ -16,9 +17,22 @@ sealed interface ReceiverStatus {
         val fileName: String,
         val bytes: Long,
         val totalBytes: Long,
+        val viaWifi: Boolean = false,
     ) : ReceiverStatus
     data class Error(val message: String) : ReceiverStatus
 }
+
+/** Anfrage eines unbekannten Geräts, die der Nutzer bestätigen muss. */
+data class IncomingRequest(
+    val id: Long,
+    val senderName: String,
+    val deviceId: String,
+    val fileCount: Int,
+    val totalBytes: Long,
+    val code: String,
+)
+
+enum class Decision { ACCEPT, ACCEPT_AND_TRUST, REJECT }
 
 /** Gemeinsamer Zustand zwischen [ReceiverService] und Oberfläche. */
 object ReceiverState {
@@ -40,6 +54,35 @@ object ReceiverState {
     /** Zeitpunkt (elapsedRealtime) der letzten Dateiübertragung, egal in welche Richtung; 0 = noch keine. */
     @Volatile
     var lastTransferAt: Long = 0L
+
+    private val _pending = MutableStateFlow<IncomingRequest?>(null)
+    /** Offene Empfangsanfrage (für Dialog und Benachrichtigung). */
+    val pending: StateFlow<IncomingRequest?> = _pending.asStateFlow()
+
+    @Volatile
+    private var answers: ArrayBlockingQueue<Decision>? = null
+
+    /** Stellt die Anfrage; der Aufrufer wartet an der zurückgegebenen Warteschlange auf die Antwort. */
+    internal fun ask(request: IncomingRequest): ArrayBlockingQueue<Decision> {
+        val queue = ArrayBlockingQueue<Decision>(1)
+        answers = queue
+        _pending.value = request
+        return queue
+    }
+
+    fun answer(requestId: Long, decision: Decision) {
+        if (_pending.value?.id == requestId) answers?.offer(decision)
+    }
+
+    /** Beantwortet eine eventuell offene Anfrage mit „Ablehnen“ (Abbruch, Dienst wird beendet). */
+    internal fun rejectPending() {
+        answers?.offer(Decision.REJECT)
+    }
+
+    internal fun clearPending() {
+        answers = null
+        _pending.value = null
+    }
 
     fun setShareActive(active: Boolean) {
         _shareActive.value = active

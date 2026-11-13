@@ -102,7 +102,10 @@ fun BluetoothGate(content: @Composable () -> Unit) {
             },
             primary = "Erlauben" to {
                 val perms = Bluetooth.requiredPermissions.toMutableList()
-                if (Build.VERSION.SDK_INT >= 33) perms += Manifest.permission.POST_NOTIFICATIONS
+                if (Build.VERSION.SDK_INT >= 33) {
+                    perms += Manifest.permission.POST_NOTIFICATIONS
+                    perms += Manifest.permission.NEARBY_WIFI_DEVICES // optional: schnelle Übertragung per WLAN-Direct
+                }
                 permLauncher.launch(perms.toTypedArray())
             },
             secondary = if (asked) {

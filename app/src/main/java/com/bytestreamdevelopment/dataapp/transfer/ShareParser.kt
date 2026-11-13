@@ -8,9 +8,6 @@ import android.webkit.MimeTypeMap
 import androidx.core.content.IntentCompat
 import java.io.File
 import java.io.IOException
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /** Wandelt einen „Teilen“-Intent (ACTION_SEND / ACTION_SEND_MULTIPLE) in zu sendende Dateien um. */
 object ShareParser {
@@ -34,11 +31,13 @@ object ShareParser {
 
         if (uris.isNotEmpty()) return uris.map { fromUri(context, it, intent.type, cache) }
 
+        // Geteilter Text/Link wird nicht als Datei verschickt, sondern landet beim Empfänger in der Zwischenablage.
         val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
-        if (!text.isNullOrEmpty()) {
-            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.GERMANY).format(Date())
+        if (!text.isNullOrBlank()) {
             val bytes = text.toByteArray(Charsets.UTF_8)
-            return listOf(OutgoingItem("Text_$stamp.txt", "text/plain", bytes.size.toLong()) { bytes.inputStream() })
+            if (bytes.size > Proto.MAX_TEXT_BYTES) throw IOException("Der Text ist zu lang")
+            val label = if (Proto.asLink(text) != null) "Link: ${text.trim()}" else "Text: ${text.trim().take(80)}"
+            return listOf(OutgoingItem(label, Proto.MIME_TEXT, bytes.size.toLong()) { bytes.inputStream() })
         }
         return emptyList()
     }

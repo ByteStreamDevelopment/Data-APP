@@ -1,6 +1,7 @@
 package com.bytestreamdevelopment.dataapp
 
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -17,6 +18,8 @@ class ShareActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Display anlassen, damit die Übertragung nicht durch den Ruhezustand unterbrochen wird.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         vm.load(intent)
         setContent { DataTheme { SendScreen(vm, onClose = ::finish) } }
     }

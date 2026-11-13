@@ -20,12 +20,12 @@ class ProtoTest {
         val payload = ByteArray(200_000) { (it % 251).toByte() }
         val bos = ByteArrayOutputStream()
         DataOutputStream(bos).use { out ->
-            Proto.writeHeader(out, Proto.Header("Pixel 8", 1, payload.size.toLong()))
+            Proto.writeHeader(out, Proto.Header("Pixel 8", 1, payload.size.toLong(), wifiOffered = true))
             Proto.writeFileHeader(out, Proto.FileHeader("Foto.jpg", "image/jpeg", payload.size.toLong()))
             out.write(payload)
         }
         val inp = DataInputStream(ByteArrayInputStream(bos.toByteArray()))
-        assertEquals(Proto.Header("Pixel 8", 1, 200_000), Proto.readHeader(inp))
+        assertEquals(Proto.Header("Pixel 8", 1, 200_000, wifiOffered = true), Proto.readHeader(inp))
         val fh = Proto.readFileHeader(inp)
         assertEquals(Proto.FileHeader("Foto.jpg", "image/jpeg", 200_000), fh)
         val out = ByteArrayOutputStream()
@@ -95,10 +95,14 @@ class ProtoTest {
     fun kontaktanfrageRoundtrip() {
         val card = ContactCard("Max Müller", "+49 170 1234567", "max@example.org", "", "https://example.org")
         val bos = ByteArrayOutputStream()
-        Proto.writeContactRequest(DataOutputStream(bos), 1234, card)
+        val photo = ByteArray(5000) { it.toByte() }
+        Proto.writeContactRequest(DataOutputStream(bos), 1234, card, photo)
         val inp = DataInputStream(ByteArrayInputStream(bos.toByteArray()))
         assertEquals(Proto.CONTACT_MAGIC, inp.readInt())
-        assertEquals(1234 to card, Proto.readContactRequest(inp))
+        val (id, payload) = Proto.readContactRequest(inp)
+        assertEquals(1234, id)
+        assertEquals(card, payload.card)
+        assertArrayEquals(photo, payload.photo)
     }
 
     @Test
@@ -136,5 +140,30 @@ class ProtoTest {
         assertFalse(t.mayExchange(20, now = 10_500, lastTransferAt = null))
         assertTrue(t.mayExchange(20, now = 11_000, lastTransferAt = null))
         assertTrue(t.mayExchange(21, now = 10_500, lastTransferAt = null))
+    }
+
+    @Test
+    fun karteOhneFoto() {
+        val bos = ByteArrayOutputStream()
+        Proto.writeCard(DataOutputStream(bos), ContactCard("A"))
+        val payload = Proto.readCard(DataInputStream(ByteArrayInputStream(bos.toByteArray())))
+        assertEquals(ContactCard("A"), payload.card)
+        assertNull(payload.photo)
+    }
+
+    @Test
+    fun linkErkennung() {
+        assertEquals("https://example.org/a?b=1", Proto.asLink("  https://example.org/a?b=1\n"))
+        assertNull(Proto.asLink("Schau mal: https://example.org"))
+        assertNull(Proto.asLink("ftp://example.org"))
+        assertNull(Proto.asLink("https://"))
+    }
+
+    @Test
+    fun wlanDatenRoundtrip() {
+        val info = Proto.WifiInfo("DIRECT-DA-abc123", "geheimespasswort", 45678)
+        val bos = ByteArrayOutputStream()
+        Proto.writeWifiInfo(DataOutputStream(bos), info)
+        assertEquals(info, Proto.readWifiInfo(DataInputStream(ByteArrayInputStream(bos.toByteArray()))))
     }
 }

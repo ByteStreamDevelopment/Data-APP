@@ -8,10 +8,12 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.bytestreamdevelopment.dataapp.storage.AppPrefs
 import com.bytestreamdevelopment.dataapp.transfer.Bluetooth
+import com.bytestreamdevelopment.dataapp.transfer.Feedback
 import com.bytestreamdevelopment.dataapp.transfer.FoundReceiver
 import com.bytestreamdevelopment.dataapp.transfer.OutgoingItem
 import com.bytestreamdevelopment.dataapp.transfer.ProximityTracker
 import com.bytestreamdevelopment.dataapp.transfer.ReceiverState
+import com.bytestreamdevelopment.dataapp.transfer.SendCallbacks
 import com.bytestreamdevelopment.dataapp.transfer.Sender
 import com.bytestreamdevelopment.dataapp.transfer.ShareParser
 import kotlinx.coroutines.CancellationException
@@ -23,11 +25,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.Closeable
+import java.util.concurrent.CopyOnWriteArrayList
 
 sealed interface SendPhase {
     data object Preparing : SendPhase
     data object Searching : SendPhase
-    data class Connecting(val to: String) : SendPhase
+    data class Connecting(val to: String, val wifi: Boolean = false) : SendPhase
+
+    /** Anfrage gesendet; das andere Handy muss annehmen. [code] steht auch dort auf dem Bildschirm. */
+    data class Waiting(val to: String, val code: String) : SendPhase
     data class Sending(
         val to: String,
         val index: Int,
@@ -36,6 +43,7 @@ sealed interface SendPhase {
         val sent: Long,
         val total: Long,
         val bytesPerSecond: Long,
+        val viaWifi: Boolean,
     ) : SendPhase
     data class Done(val to: String, val count: Int) : SendPhase
     data class Failed(val message: String, val canRetry: Boolean) : SendPhase
@@ -59,9 +67,17 @@ class SendViewModel(app: Application) : AndroidViewModel(app) {
 
     private var loaded = false
     private var scanJob: Job? = null
+    private var sendJob: Job? = null
     private val found = HashMap<String, FoundReceiver>()
     private val lastSeen = HashMap<String, Long>()
     private val smoothed = HashMap<String, Int>()
+
+    /** Offene Verbindungen des laufenden Versands; Schließen bricht blockierende Aufrufe ab. */
+    private val closeables = CopyOnWriteArrayList<Closeable>()
+
+    /** Kennzeichnet den aktuellen Versand, damit ein abgebrochener keine Anzeige mehr überschreibt. */
+    @Volatile
+    private var token: Any? = null
 
     fun load(intent: Intent) {
         if (loaded) return
@@ -134,36 +150,79 @@ class SendViewModel(app: Application) : AndroidViewModel(app) {
         scanJob?.cancel()
         scanJob = null
         val items = _items.value
-        _phase.value = SendPhase.Connecting(target.name)
-        viewModelScope.launch {
+        val app = getApplication<Application>()
+        val mine = Any()
+        token = mine
+        fun show(phase: SendPhase) {
+            if (token === mine) _phase.value = phase
+        }
+        show(SendPhase.Connecting(target.name))
+        Feedback.detected(app, prefs)
+        sendJob = viewModelScope.launch {
             try {
-                val start = SystemClock.elapsedRealtime()
+                var start = SystemClock.elapsedRealtime()
                 var lastUi = 0L
-                withContext(Dispatchers.IO) {
-                    delay(200) // Scanner kurz zur Ruhe kommen lassen, verbessert den Verbindungsaufbau
-                    Sender.send(target.device, target.psm, Bluetooth.deviceName(getApplication()), items) { index, sent, total ->
+                var started = false
+                val callbacks = SendCallbacks(
+                    onCloseable = { closeables += it },
+                    onWaiting = { code -> show(SendPhase.Waiting(target.name, code)) },
+                    onAccepted = { wifi -> show(SendPhase.Connecting(target.name, wifi)) },
+                    onProgress = { index, sent, total, viaWifi ->
                         val now = SystemClock.elapsedRealtime()
+                        if (!started) {
+                            started = true
+                            start = now // Wartezeit auf die Annahme nicht in die Geschwindigkeit einrechnen
+                        }
                         if (now - lastUi >= 200 || sent == total) {
                             lastUi = now
                             val secs = (now - start).coerceAtLeast(1) / 1000.0
-                            _phase.value = SendPhase.Sending(
-                                target.name, index, items.size, items[index].name, sent, total, (sent / secs).toLong(),
+                            show(
+                                SendPhase.Sending(
+                                    target.name, index, items.size, items[index].name, sent, total, (sent / secs).toLong(), viaWifi,
+                                )
                             )
                         }
-                    }
+                    },
+                )
+                withContext(Dispatchers.IO) {
+                    delay(200) // Scanner kurz zur Ruhe kommen lassen, verbessert den Verbindungsaufbau
+                    Sender.send(app, prefs, target.device, target.psm, Bluetooth.deviceName(app), items, callbacks)
                 }
                 ReceiverState.lastTransferAt = SystemClock.elapsedRealtime()
-                _phase.value = SendPhase.Done(target.name, items.size)
+                if (token === mine) Feedback.success(app, prefs)
+                show(SendPhase.Done(target.name, items.size))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.w(TAG, "Senden fehlgeschlagen", e)
                 ReceiverState.lastTransferAt = SystemClock.elapsedRealtime()
-                _phase.value = SendPhase.Failed(
-                    "Senden an ${target.name} fehlgeschlagen: ${e.message ?: "Verbindung unterbrochen"}", canRetry = true,
+                if (token === mine) Feedback.failure(app, prefs)
+                show(
+                    SendPhase.Failed(
+                        "Senden an ${target.name} fehlgeschlagen: ${e.message ?: "Verbindung unterbrochen"}", canRetry = true,
+                    )
                 )
+            } finally {
+                closeAll()
             }
         }
+    }
+
+    /** Bricht Verbindungsaufbau, Warten oder Übertragung ab. */
+    fun cancel() {
+        val phase = _phase.value
+        if (phase !is SendPhase.Connecting && phase !is SendPhase.Waiting && phase !is SendPhase.Sending) return
+        token = null
+        _phase.value = SendPhase.Failed("Übertragung abgebrochen.", canRetry = true)
+        sendJob?.cancel()
+        closeAll()
+    }
+
+    private fun closeAll() {
+        val open = closeables.toList()
+        closeables.clear()
+        // Schließen kann kurz blockieren (WLAN-Gruppe abbauen) → nicht auf dem Hauptthread.
+        Thread { open.forEach { runCatching { it.close() } } }.start()
     }
 
     fun retry() {
@@ -178,6 +237,11 @@ class SendViewModel(app: Application) : AndroidViewModel(app) {
             scanJob?.cancel()
             scanJob = null
         }
+    }
+
+    override fun onCleared() {
+        token = null
+        closeAll()
     }
 
     companion object {
