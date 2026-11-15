@@ -68,6 +68,12 @@
   `/opt/android-sdk` (cmdline-tools von dl.google.com; `platforms;android-35`, `build-tools;35.0.0`),
   `local.properties` mit `sdk.dir=/opt/android-sdk`. Maven Central liefert oft 429 → mit `--max-workers=1` erneut bauen.
   Kein KVM/Emulator, und BLE lässt sich ohnehin nur auf zwei echten Handys testen.
+- **Release**: Workflow `.github/workflows/release.yml` (workflow_dispatch, Eingaben `version`, `notes`) baut
+  `assembleRelease`, erstellt Tag `vX.Y.Z` und GitHub-Release mit `data-app-vX.Y.Z.apk`; versionCode = Laufnummer.
+  Feste Signatur nur mit den Secrets `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`; sonst
+  Wegwerf-Debug-Schlüssel des Runners (kein Update über ältere Version möglich). Claude hat kein Werkzeug zum direkten
+  Anlegen von Releases → Workflow per `actions_run_trigger` starten. Der Workflow muss auf dem Standard-Branch liegen.
+  Branches: `main` enthält alles; Standard-Branch war am 2026-11-15 noch `claude/gallant-pasteur-gezi78`.
 - **Bekannte Grenzen / Ideen**: Durchsatz von BLE-L2CAP ca. 50–300 KB/s je nach Handy (große Videos dauern);
   RSSI-Werte schwanken je nach Modell → Einstellung „Sehr nah“ als Ausweichoption.
   **Ungetestet auf echten Geräten** (Stand 2026-11): gesamte Funkstrecke, besonders `LinkBooster` und `WifiDirect` –

@@ -39,4 +39,14 @@ Empfangene Dateien landen in `Bilder/Data-App`, `Filme/Data-App`, `Musik/Data-Ap
 
 Release-APK: `./gradlew assembleRelease` (optional mit `keystore.properties`: `storeFile`, `storePassword`,
 `keyAlias`, `keyPassword`; ohne Datei wird mit dem Debug-Schlüssel signiert).
-Die GitHub-Action baut bei jedem Push eine APK als Artefakt.
+Die GitHub-Action „Build“ baut bei jedem Push eine APK als Artefakt.
+
+## Release
+
+Actions → **Release** → „Run workflow“ mit der Versionsnummer (z. B. `1.0.0`) starten. Der Workflow baut die APK,
+legt den Tag `v1.0.0` an und veröffentlicht ein Release mit `data-app-v1.0.0.apk`.
+
+Damit sich spätere Versionen über ältere installieren lassen, braucht es einen festen Signaturschlüssel. Dafür einmalig
+diese Repository-Secrets anlegen (Settings → Secrets and variables → Actions): `KEYSTORE_BASE64` (Keystore-Datei,
+base64-kodiert), `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`. Ohne Secrets wird mit einem Schlüssel signiert,
+der bei jedem Lauf neu entsteht.
